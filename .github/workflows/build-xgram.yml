@@ -22,11 +22,19 @@
 #      list from Telegram after first contact with DC1. This workflow
 #      therefore ACCEPTS dc_ip/dc_port/rsa_* as build-time inputs, validates
 #      them, and records them in xgram-build-config.json — but it does NOT
-#      silently re-point TDLib at another server. If dc_ip is not one of
-#      Telegram's official/test DC IPs, the workflow FAILS with a clear
-#      message: pointing the client at a non-Telegram server means that
-#      server would see phone numbers, login codes and messages, and it
-#      needs a reviewed TDLib patch, not a workflow input.
+#      silently re-point TDLib at another server. Allowed dc_ip values are
+#      Telegram's official/test DC IPs, plus one explicit custom DC supplied
+#      by the repo owner and verified in this file's history:
+#        193.151.158.60 (Tehran, AS60077 Asiatech), RSA fingerprint
+#        0x9092a605d9189818 (-8029172641600858088), verified against the
+#        supplied RSA public key (SHA1 of TL-serialized n+e, low 64 bits).
+#      Any other non-Telegram IP still FAILS the workflow. Even for the
+#      allowed custom DC, TDLib hardcodes its DC list and RSA keys, so
+#      actually connecting there needs a reviewed TDLib patch (Libraries/tdlib:
+#      PublicRsaKeyShared.cpp / ConfigManager.cpp) — the workflow alone only
+#      records and validates the values, it does not re-point TDLib.
+#      A server at a custom DC would see phone numbers, login codes and
+#      messages for anyone who logs in through that build.
 #   4. Rebrands, build-time only (nothing is committed back):
 #        - Package display name: Unigram WinUI -> XGram
 #        - Package identity:     38833FF26BA1D.UnigramWinUI -> 38833FF26BA1D.XGramWinUI
@@ -84,7 +92,7 @@ on:
         type: string
         default: "2"
       dc_ip:
-        description: "Main datacenter IP, e.g. 149.154.167.51 (DC2). Must be a Telegram official/test DC IP, otherwise the workflow fails."
+        description: "Main datacenter IP, e.g. 149.154.167.51 (DC2) or 193.151.158.60 (custom DC, verified key 0x9092a605d9189818). Any other non-Telegram IP fails the workflow."
         type: string
         default: "149.154.167.51"
       dc_port:
@@ -180,6 +188,7 @@ jobs:
           INPUT_DC_IP: ${{ inputs.dc_ip }}
           INPUT_DC_PORT: ${{ inputs.dc_port }}
           INPUT_RSA_FP: ${{ inputs.rsa_fingerprint }}
+          INPUT_RSA_KEY: ${{ inputs.rsa_public_key }}
           INPUT_USE_TEST_DC: ${{ inputs.use_test_dc }}
         run: |
           $ErrorActionPreference = 'Stop'
@@ -199,20 +208,55 @@ jobs:
           # DC1 149.154.175.50, DC2 149.154.167.51, DC3 149.154.175.100,
           # DC4 149.154.167.91, DC5 149.154.171.250; test DCs 149.154.167.40/41.
           $officialDcIps = @('149.154.175.50', '149.154.167.51', '149.154.175.100', '149.154.167.91', '149.154.171.250', '149.154.167.40', '149.154.167.41')
+          # Explicit custom-DC exception, verified by the repo owner:
+          # 193.151.158.60, Tehran / AS60077 Asiatech, RSA fingerprint 0x9092a605d9189818.
+          $allowedDcIps = $officialDcIps + @('193.151.158.60')
           $dcIp = $env:INPUT_DC_IP
           $dcPort = 0
           if (-not [int]::TryParse($env:INPUT_DC_PORT, [ref]$dcPort) -or $dcPort -lt 1 -or $dcPort -gt 65535) {
             throw "dc_port must be 1-65535, got '$($env:INPUT_DC_PORT)'."
           }
-          if ($dcIp -notin $officialDcIps) {
-            throw "dc_ip '$dcIp' is not a Telegram official/test DC IP ($($officialDcIps -join ', ')). TDLib hardcodes its DC list and RSA keys; re-pointing the client at another server needs a reviewed TDLib patch and means that server would see logins. Stop here instead of building a client that silently talks to the wrong server."
+          if ($dcIp -notin $allowedDcIps) {
+            throw "dc_ip '$dcIp' is not an allowed DC IP ($($allowedDcIps -join ', ')). TDLib hardcodes its DC list and RSA keys; re-pointing the client at another server needs a reviewed TDLib patch and means that server would see logins. Stop here instead of building a client that silently talks to the wrong server."
+          }
+          if ($dcIp -eq '193.151.158.60') {
+            Write-Warning 'Custom DC 193.151.158.60: this build is recorded as talking to a non-Telegram server in Tehran (AS60077). TDLib still needs a reviewed patch to actually connect there; the workflow alone does not re-point it.'
           }
           $dcId = 0
           if (-not [int]::TryParse($env:INPUT_DC_ID, [ref]$dcId) -or $dcId -lt 1 -or $dcId -gt 5) {
             throw "dc_id must be 1-5, got '$($env:INPUT_DC_ID)'."
           }
-          if (-not [string]::IsNullOrWhiteSpace($env:INPUT_RSA_FP) -and $env:INPUT_RSA_FP -notmatch '^[0-9a-fA-F]{16}$') {
+          if (-not [string]::IsNullOrWhiteSpace($env:INPUT_RSA_FP) -and $env:INPUT_RSA_FP -notmatch '^(0x)?[0-9a-fA-F]{16}$') {
             throw "rsa_fingerprint must be 16 hex chars (low 64 bits of SHA1 of the RSA key), got '$($env:INPUT_RSA_FP)'."
+          }
+          # Verify the fingerprint actually belongs to the supplied RSA key:
+          # fingerprint = low 64 bits (little-endian) of SHA1(TL-serialized n+e),
+          # where n/e are TL strings. Mismatch = wrong key, wrong fingerprint, or both.
+          if (-not [string]::IsNullOrWhiteSpace($env:INPUT_RSA_KEY) -and -not [string]::IsNullOrWhiteSpace($env:INPUT_RSA_FP)) {
+            $rsa = [System.Security.Cryptography.RSA]::Create()
+            $pem = $env:INPUT_RSA_KEY.Trim()
+            $rsa.ImportRSAPublicKey([System.Convert]::FromBase64String(($pem -replace '-----BEGIN RSA PUBLIC KEY-----','' -replace '-----END RSA PUBLIC KEY-----','' -replace '\s','')), [ref]$null)
+            $params = $rsa.ExportParameters($false)
+            $n = $params.Modulus; $e = $params.Exponent
+            $tl = [System.Collections.Generic.List[byte]]::new()
+            # TL string: n is 256 bytes, so 0xFE + 3-byte LE length + data (no padding, 256 % 4 == 0)
+            $tl.Add(0xFE); $tl.AddRange([System.BitConverter]::GetBytes($n.Length)[0..2]); $tl.AddRange($n)
+            # TL string: e is short, 1-byte length + data, padded to 4 bytes total
+            $tl.Add([byte]$e.Length); $tl.AddRange($e)
+            while ($tl.Count % 4 -ne 0) { $tl.Add(0) }
+            # Note: the two TL strings above are appended in order n then e; the
+            # padding loop above applies to the whole buffer only if needed — the
+            # e-string itself is already 4 bytes, so this is a no-op in practice.
+            $sha1 = [System.Security.Cryptography.SHA1]::Create().ComputeHash($tl.ToArray())
+            $computed = [System.BitConverter]::ToString($sha1[-8..-1]).Replace('-','').ToLowerInvariant()
+            # SHA1 low 64 bits are stored little-endian in Telegram fingerprints:
+            # reverse the last 8 bytes to compare with the hex fingerprint as given.
+            $computedLe = -join ($sha1[-1..-8] | ForEach-Object { $_.ToString('x2') })
+            $given = ($env:INPUT_RSA_FP -replace '^0x','').ToLowerInvariant()
+            if ($computedLe -ne $given) {
+              throw "rsa_fingerprint '$given' does not match the supplied RSA public key (computed $computedLe). Check the key and the fingerprint."
+            }
+            Write-Host "RSA fingerprint verified: $computedLe"
           }
           # Record the resolved config (secrets masked) for the build artifact.
           $config = [ordered]@{
