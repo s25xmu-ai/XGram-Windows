@@ -9,6 +9,24 @@
 #        TELEGRAM_API_HASH — ApiHash from the same page
 #      Without them the build cannot even start: the file is git-ignored
 #      and the project does not compile without it.
+#      ApiId/ApiHash can also be given as workflow_dispatch inputs at run
+#      time (inputs win over secrets). WARNING: inputs are visible in the
+#      workflow-run history to anyone with repo access; ApiHash is a secret,
+#      so prefer the secret unless you are running a one-off test build.
+#
+#      Datacenter / RSA: Unigram itself has NO setting for a DC IP, port or
+#      RSA key. ApiId/ApiHash are the only Telegram credentials in Unigram
+#      (Telegram/Constants.Secret.cs -> SetTdlibParameters). The DC list and
+#      the server RSA keys are hardcoded inside TDLib (Libraries/tdlib,
+#      PublicRsaKeyShared.cpp / Config.cpp), and TDLib fetches the live DC
+#      list from Telegram after first contact with DC1. This workflow
+#      therefore ACCEPTS dc_ip/dc_port/rsa_* as build-time inputs, validates
+#      them, and records them in xgram-build-config.json — but it does NOT
+#      silently re-point TDLib at another server. If dc_ip is not one of
+#      Telegram's official/test DC IPs, the workflow FAILS with a clear
+#      message: pointing the client at a non-Telegram server means that
+#      server would see phone numbers, login codes and messages, and it
+#      needs a reviewed TDLib patch, not a workflow input.
 #   4. Rebrands, build-time only (nothing is committed back):
 #        - Package display name: Unigram WinUI -> XGram
 #        - Package identity:     38833FF26BA1D.UnigramWinUI -> 38833FF26BA1D.XGramWinUI
@@ -47,6 +65,38 @@ on:
         default: x64
       version:
         description: "Version (4 parts, e.g. 13.1.3.0). Leave empty to use Telegram.Msix/Package.appxmanifest."
+        type: string
+        default: ""
+      api_id:
+        description: "Telegram ApiId (my.telegram.org). Leave empty to use secret TELEGRAM_API_ID."
+        type: string
+        default: ""
+      api_hash:
+        description: "Telegram ApiHash. Leave empty to use secret TELEGRAM_API_HASH. Prefer the secret: inputs are visible in run history."
+        type: string
+        default: ""
+      use_test_dc:
+        description: "Use Telegram test DCs instead of production DCs (SetTdlibParameters useTestDc)"
+        type: boolean
+        default: false
+      dc_id:
+        description: "Main datacenter id (1-5 production, 1-3 test). Recorded in the build config; TDLib uses its own DC list."
+        type: string
+        default: "2"
+      dc_ip:
+        description: "Main datacenter IP, e.g. 149.154.167.51 (DC2). Must be a Telegram official/test DC IP, otherwise the workflow fails."
+        type: string
+        default: "149.154.167.51"
+      dc_port:
+        description: "Main datacenter port, e.g. 443"
+        type: string
+        default: "443"
+      rsa_public_key:
+        description: "RSA public key for the DC (PEM or base64, single line). Leave empty to use TDLib's built-in Telegram keys."
+        type: string
+        default: ""
+      rsa_fingerprint:
+        description: "RSA public key fingerprint (16 hex chars, low 64 bits of SHA1 of the key). Leave empty if unknown."
         type: string
         default: ""
       create_release:
@@ -119,20 +169,69 @@ jobs:
             Write-Host 'Inno Setup already installed.'
           }
 
-      - name: Generate Telegram/Constants.Secret.cs from secrets
+      - name: Resolve Telegram config (inputs win over secrets)
         shell: pwsh
         env:
-          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
-          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          INPUT_API_ID: ${{ inputs.api_id }}
+          INPUT_API_HASH: ${{ inputs.api_hash }}
+          SECRET_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          SECRET_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          INPUT_DC_ID: ${{ inputs.dc_id }}
+          INPUT_DC_IP: ${{ inputs.dc_ip }}
+          INPUT_DC_PORT: ${{ inputs.dc_port }}
+          INPUT_RSA_FP: ${{ inputs.rsa_fingerprint }}
+          INPUT_USE_TEST_DC: ${{ inputs.use_test_dc }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if ([string]::IsNullOrWhiteSpace($env:TELEGRAM_API_ID) -or [string]::IsNullOrWhiteSpace($env:TELEGRAM_API_HASH)) {
-            throw 'Missing secrets: set TELEGRAM_API_ID and TELEGRAM_API_HASH in Settings > Secrets and variables > Actions (from https://my.telegram.org/apps).'
+          $apiIdText = $env:INPUT_API_ID
+          if ([string]::IsNullOrWhiteSpace($apiIdText)) { $apiIdText = $env:SECRET_API_ID }
+          $apiHash = $env:INPUT_API_HASH
+          if ([string]::IsNullOrWhiteSpace($apiHash)) { $apiHash = $env:SECRET_API_HASH }
+          if ([string]::IsNullOrWhiteSpace($apiIdText) -or [string]::IsNullOrWhiteSpace($apiHash)) {
+            throw 'Missing Telegram credentials: set ApiId/ApiHash as workflow inputs, or set TELEGRAM_API_ID and TELEGRAM_API_HASH in Settings > Secrets and variables > Actions (from https://my.telegram.org/apps).'
           }
           $apiId = 0
-          if (-not [int]::TryParse($env:TELEGRAM_API_ID, [ref]$apiId)) {
-            throw 'TELEGRAM_API_ID must be an integer.'
+          if (-not [int]::TryParse($apiIdText, [ref]$apiId)) {
+            throw 'ApiId must be an integer.'
           }
+          # --- Datacenter validation ---
+          # Telegram production DCs (help.getConfig / core.telegram.org/api/datacenter):
+          # DC1 149.154.175.50, DC2 149.154.167.51, DC3 149.154.175.100,
+          # DC4 149.154.167.91, DC5 149.154.171.250; test DCs 149.154.167.40/41.
+          $officialDcIps = @('149.154.175.50', '149.154.167.51', '149.154.175.100', '149.154.167.91', '149.154.171.250', '149.154.167.40', '149.154.167.41')
+          $dcIp = $env:INPUT_DC_IP
+          $dcPort = 0
+          if (-not [int]::TryParse($env:INPUT_DC_PORT, [ref]$dcPort) -or $dcPort -lt 1 -or $dcPort -gt 65535) {
+            throw "dc_port must be 1-65535, got '$($env:INPUT_DC_PORT)'."
+          }
+          if ($dcIp -notin $officialDcIps) {
+            throw "dc_ip '$dcIp' is not a Telegram official/test DC IP ($($officialDcIps -join ', ')). TDLib hardcodes its DC list and RSA keys; re-pointing the client at another server needs a reviewed TDLib patch and means that server would see logins. Stop here instead of building a client that silently talks to the wrong server."
+          }
+          $dcId = 0
+          if (-not [int]::TryParse($env:INPUT_DC_ID, [ref]$dcId) -or $dcId -lt 1 -or $dcId -gt 5) {
+            throw "dc_id must be 1-5, got '$($env:INPUT_DC_ID)'."
+          }
+          if (-not [string]::IsNullOrWhiteSpace($env:INPUT_RSA_FP) -and $env:INPUT_RSA_FP -notmatch '^[0-9a-fA-F]{16}$') {
+            throw "rsa_fingerprint must be 16 hex chars (low 64 bits of SHA1 of the RSA key), got '$($env:INPUT_RSA_FP)'."
+          }
+          # Record the resolved config (secrets masked) for the build artifact.
+          $config = [ordered]@{
+            api_id = $apiId
+            api_hash_present = -not [string]::IsNullOrWhiteSpace($apiHash)
+            api_hash_from = if ([string]::IsNullOrWhiteSpace($env:INPUT_API_HASH)) { 'secret' } else { 'workflow input' }
+            use_test_dc = ($env:INPUT_USE_TEST_DC -eq 'true')
+            dc_id = $dcId
+            dc_ip = $dcIp
+            dc_port = $dcPort
+            rsa_public_key_present = -not [string]::IsNullOrWhiteSpace('${{ inputs.rsa_public_key }}')
+            rsa_fingerprint = $env:INPUT_RSA_FP
+          }
+          ($config | ConvertTo-Json) | Out-File -FilePath 'xgram-build-config.json' -Encoding utf8
+          "XGRAM_API_ID=$apiId" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # ApiHash only via a masked env file for the next step; never echo it.
+          $apiHash | Out-File -FilePath 'xgram-api-hash.txt' -Encoding utf8 -NoNewline
+          Write-Host "ApiId=$apiId, DC=$dcId $dcIp`:$dcPort, use_test_dc=$($env:INPUT_USE_TEST_DC), rsa_fingerprint='$($env:INPUT_RSA_FP)'"
+          $apiHash = Get-Content 'xgram-api-hash.txt' -Raw
           $secret = @"
           namespace Telegram
           {
@@ -141,7 +240,7 @@ jobs:
                   static Constants()
                   {
                       ApiId = $apiId;
-                      ApiHash = "$($env:TELEGRAM_API_HASH)";
+                      ApiHash = "$apiHash";
                       AppChannel = "";
                       AppReportsId = "";
                       AppCenterId = "";
@@ -154,6 +253,36 @@ jobs:
           "@
           $secret | Out-File -FilePath 'Telegram/Constants.Secret.cs' -Encoding utf8
           Write-Host 'Wrote Telegram/Constants.Secret.cs (ApiId present, ApiHash hidden).'
+
+      - name: Apply use_test_dc (build-time only, if requested)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ('${{ inputs.use_test_dc }}' -eq 'true') {
+            $path = 'Telegram/Services/ClientService.cs'
+            $text = Get-Content $path -Raw
+            if ($text -notmatch 'useTestDc: _settings.UseTestDC') {
+              throw 'ClientService.cs no longer contains "useTestDc: _settings.UseTestDC" — the test-DC patch does not apply to this revision.'
+            }
+            Set-Content $path ($text.Replace('useTestDc: _settings.UseTestDC', 'useTestDc: true')) -NoNewline
+            Write-Host 'Forced useTestDc: true for this build.'
+          } else {
+            Write-Host 'Production DCs (useTestDc left as the app setting).'
+          }
+
+      - name: Save RSA public key (if provided)
+        shell: pwsh
+        env:
+          INPUT_RSA_KEY: ${{ inputs.rsa_public_key }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not [string]::IsNullOrWhiteSpace($env:INPUT_RSA_KEY)) {
+            $env:INPUT_RSA_KEY | Out-File -FilePath 'xgram-rsa-public-key.txt' -Encoding utf8 -NoNewline
+            Write-Host 'Saved RSA public key to xgram-rsa-public-key.txt (public key only, no private key).'
+            Write-Host 'NOTE: this key is recorded only. TDLib uses its built-in Telegram keys; using a different key requires a TDLib patch.'
+          } else {
+            Write-Host 'No RSA public key provided; using TDLib built-in Telegram keys.'
+          }
 
       - name: Rebrand Unigram -> XGram (build-time only)
         shell: pwsh
@@ -270,6 +399,16 @@ jobs:
             ${{ steps.outputs.outputs.zip }}
           retention-days: 30
           if-no-files-found: error
+
+      - name: Upload build config record (secrets masked)
+        uses: actions/upload-artifact@v4
+        with:
+          name: XGram-build-config-${{ steps.version.outputs.version }}
+          path: |
+            xgram-build-config.json
+            xgram-rsa-public-key.txt
+          retention-days: 30
+          if-no-files-found: ignore
 
       - name: Create GitHub Release
         if: ${{ inputs.create_release }}
