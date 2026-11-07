@@ -28,13 +28,31 @@
 #        193.151.158.60 (Tehran, AS60077 Asiatech), RSA fingerprint
 #        0x9092a605d9189818 (-8029172641600858088), verified against the
 #        supplied RSA public key (SHA1 of TL-serialized n+e, low 64 bits).
-#      Any other non-Telegram IP still FAILS the workflow. Even for the
-#      allowed custom DC, TDLib hardcodes its DC list and RSA keys, so
-#      actually connecting there needs a reviewed TDLib patch (Libraries/tdlib:
-#      PublicRsaKeyShared.cpp / ConfigManager.cpp) — the workflow alone only
-#      records and validates the values, it does not re-point TDLib.
-#      A server at a custom DC would see phone numbers, login codes and
-#      messages for anyone who logs in through that build.
+#      Any other non-Telegram IP still FAILS the workflow.
+#
+#      Custom DC patch (TDLib 4c6377aa, the submodule pinned in this repo):
+#      the workflow step "Patch TDLib for custom DC" applies it, build-time
+#      only, before the tdjson build, and only when dc_ip is the custom DC:
+#        1. Libraries/tdlib/td/telegram/net/ConnectionCreator.cpp,
+#           get_default_dc_options(): production DC2
+#             add_ip_ports(2, {"149.154.167.51", "95.161.76.100"}, ports)
+#           becomes
+#             add_ip_ports(2, {"193.151.158.60"}, {2398})
+#           (ports 443/80/5222 are NOT used for the custom DC.)
+#        2. Libraries/tdlib/td/telegram/net/PublicRsaKeySharedMain.cpp,
+#           PublicRsaKeySharedMain::create(false): the owner's RSA PEM is
+#           added as a second key next to Telegram's main key, so a server
+#           presenting fingerprint 0x9092a605d9189818 is accepted.
+#           (get_rsa_key() otherwise fails with "Unknown Main fingerprints".)
+#      Limits, read before using a custom-DC build:
+#        - ConfigManager still fetches SimpleConfig / FullConfig from
+#          Telegram, which can re-add official DC2 options. The custom DC
+#          is therefore the DC2 default, not a guarantee that no official
+#          DC is ever tried. If the custom server is a full MTProto server,
+#          its own config should list the custom DC; if it is a forwarder
+#          to Telegram, other DCs will still go to Telegram.
+#        - A server at a custom DC would see phone numbers, login codes and
+#          messages for anyone who logs in through that build.
 #   4. Rebrands, build-time only (nothing is committed back):
 #        - Package display name: Unigram WinUI -> XGram
 #        - Package identity:     38833FF26BA1D.UnigramWinUI -> 38833FF26BA1D.XGramWinUI
@@ -88,25 +106,25 @@ on:
         type: boolean
         default: false
       dc_id:
-        description: "Main datacenter id (1-5 production, 1-3 test). Recorded in the build config; TDLib uses its own DC list."
+        description: "Main datacenter id (1-5 production, 1-3 test). For the custom DC, use 2."
         type: string
         default: "2"
       dc_ip:
-        description: "Main datacenter IP, e.g. 149.154.167.51 (DC2) or 193.151.158.60 (custom DC, verified key 0x9092a605d9189818). Any other non-Telegram IP fails the workflow."
+        description: "Main datacenter IP. Default is the owner's server 193.151.158.60 (DC2, port 2398). Use 149.154.167.51 for Telegram DC2."
         type: string
-        default: "149.154.167.51"
+        default: "193.151.158.60"
       dc_port:
-        description: "Main datacenter port, e.g. 443"
+        description: "Main datacenter port. Default 2398 for the owner's server; 443 for Telegram DCs."
         type: string
-        default: "443"
+        default: "2398"
       rsa_public_key:
         description: "RSA public key for the DC (PEM or base64, single line). Leave empty to use TDLib's built-in Telegram keys."
         type: string
         default: ""
       rsa_fingerprint:
-        description: "RSA public key fingerprint (16 hex chars, low 64 bits of SHA1 of the key). Leave empty if unknown."
+        description: "RSA public key fingerprint (16 hex chars, low 64 bits of SHA1 of the key). Default is the owner's key 9092a605d9189818."
         type: string
-        default: ""
+        default: "9092a605d9189818"
       create_release:
         description: "Also create a GitHub Release with the zip attached"
         type: boolean
@@ -205,9 +223,10 @@ jobs:
           }
           # --- Datacenter validation ---
           # Telegram production DCs (help.getConfig / core.telegram.org/api/datacenter):
-          # DC1 149.154.175.50, DC2 149.154.167.51, DC3 149.154.175.100,
-          # DC4 149.154.167.91, DC5 149.154.171.250; test DCs 149.154.167.40/41.
-          $officialDcIps = @('149.154.175.50', '149.154.167.51', '149.154.175.100', '149.154.167.91', '149.154.171.250', '149.154.167.40', '149.154.167.41')
+          # DC1 149.154.175.50, DC2 149.154.167.51 / 95.161.76.100, DC3 149.154.175.100,
+          # DC4 149.154.167.91, DC5 149.154.171.5; test DCs 149.154.175.10, 149.154.167.40, 149.154.175.117.
+          # (from TDLib 4c6377aa, ConnectionCreator::get_default_dc_options)
+          $officialDcIps = @('149.154.175.50', '149.154.167.51', '95.161.76.100', '149.154.175.100', '149.154.167.91', '149.154.171.5', '149.154.175.10', '149.154.167.40', '149.154.175.117')
           # Explicit custom-DC exception, verified by the repo owner:
           # 193.151.158.60, Tehran / AS60077 Asiatech, RSA fingerprint 0x9092a605d9189818.
           $allowedDcIps = $officialDcIps + @('193.151.158.60')
@@ -383,6 +402,57 @@ jobs:
           }
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           Write-Host "Version: $version"
+
+      - name: Patch TDLib for custom DC (build-time only)
+        shell: pwsh
+        env:
+          INPUT_DC_ID: ${{ inputs.dc_id }}
+          INPUT_DC_IP: ${{ inputs.dc_ip }}
+          INPUT_DC_PORT: ${{ inputs.dc_port }}
+          INPUT_RSA_KEY: ${{ inputs.rsa_public_key }}
+          INPUT_RSA_FP: ${{ inputs.rsa_fingerprint }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dcIp = $env:INPUT_DC_IP
+          $officialDcIps = @('149.154.175.50', '149.154.167.51', '95.161.76.100', '149.154.175.100', '149.154.167.91', '149.154.171.5', '149.154.175.10', '149.154.167.40', '149.154.175.117')
+          if ($dcIp -in $officialDcIps) {
+            Write-Host "Official DC $dcIp — no TDLib patch needed."
+            return
+          }
+          if ([string]::IsNullOrWhiteSpace($env:INPUT_RSA_KEY)) {
+            throw "Custom DC $dcIp needs rsa_public_key: the server's RSA public key (PEM) must be given as a workflow input."
+          }
+          $dcId = [int]$env:INPUT_DC_ID
+          $dcPort = [int]$env:INPUT_DC_PORT
+          # 1. ConnectionCreator.cpp — replace the production DC2 entry only.
+          $ccPath = 'Libraries/tdlib/td/telegram/net/ConnectionCreator.cpp'
+          $cc = Get-Content $ccPath -Raw
+          $oldDc2 = 'add_ip_ports(2, {"149.154.167.51", "95.161.76.100"}, ports);'
+          if ($cc -notmatch [regex]::Escape($oldDc2)) {
+            throw "TDLib patch does not apply: expected DC2 line not found in $ccPath (TDLib version drift?). Line was: $oldDc2"
+          }
+          # Only patch the production branch: the test branch has no such line.
+          $newDc2 = "add_ip_ports($dcId, {`"$dcIp`"}, {$dcPort}); // XGram custom DC$dcId"
+          $cc = $cc.Replace($oldDc2, $newDc2)
+          Set-Content $ccPath $cc -NoNewline
+          if ((Get-Content $ccPath -Raw) -match '149.154.167.51') {
+            throw "TDLib patch failed: official DC2 IP 149.154.167.51 is still in $ccPath."
+          }
+          # 2. PublicRsaKeySharedMain.cpp — add the owner's key next to Telegram's main key.
+          $rsaPath = 'Libraries/tdlib/td/telegram/net/PublicRsaKeySharedMain.cpp'
+          $rsaCpp = Get-Content $rsaPath -Raw
+          $marker = '-----END RSA PUBLIC KEY-----");'
+          $idx = $rsaCpp.LastIndexOf($marker)
+          if ($idx -lt 0) {
+            throw "TDLib patch does not apply: RSA key marker not found in $rsaPath."
+          }
+          $pemLines = ($env:INPUT_RSA_KEY -split "`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+          $cppLines = $pemLines | ForEach-Object { "              `"$_\n`"" }
+          $insert = "`n      add_pem(keys,`n" + ($cppLines -join "`n") + "); // XGram custom DC key, fingerprint $($env:INPUT_RSA_FP)"
+          $rsaCpp = $rsaCpp.Insert($idx + $marker.Length, $insert)
+          Set-Content $rsaPath $rsaCpp -NoNewline
+          Write-Host "Patched TDLib: DC$dcId -> $dcIp`:$dcPort, RSA key added to PublicRsaKeySharedMain (fingerprint $($env:INPUT_RSA_FP))."
+          Write-Host 'Verify with: git -C Libraries/tdlib diff --stat'
 
       - name: Build TDLib (desktop triplet)
         shell: pwsh
