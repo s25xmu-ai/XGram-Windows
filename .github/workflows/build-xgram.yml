@@ -454,6 +454,25 @@ jobs:
           Write-Host "Patched TDLib: DC$dcId -> $dcIp`:$dcPort, RSA key added to PublicRsaKeySharedMain (fingerprint $($env:INPUT_RSA_FP))."
           Write-Host 'Verify with: git -C Libraries/tdlib diff --stat'
 
+      - name: Install gperf (TDLib build dependency)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # TDLib's tdutils/generate CMakeLists requires gperf; it is not
+          # on PATH on the GitHub-hosted Windows image. Chocolatey (preinstalled
+          # on the runner) has GNU gperf 3.1.
+          if (Get-Command gperf -ErrorAction SilentlyContinue) {
+            gperf --version | Select-Object -First 1
+          } else {
+            choco install gperf -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "choco install gperf failed with exit code $LASTEXITCODE." }
+            $chocoBin = 'C:\ProgramData\chocolatey\bin'
+            if ($env:PATH -notlike "*$chocoBin*") { $env:PATH = "$chocoBin;$env:PATH" }
+            # Make gperf visible to later steps (each runs a fresh shell).
+            $chocoBin | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+            gperf --version | Select-Object -First 1
+          }
+
       - name: Build TDLib (desktop triplet)
         shell: pwsh
         run: |
