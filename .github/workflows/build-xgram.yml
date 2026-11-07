@@ -259,7 +259,7 @@ jobs:
             $n = $params.Modulus; $e = $params.Exponent
             $tl = [System.Collections.Generic.List[byte]]::new()
             # TL string: n is 256 bytes, so 0xFE + 3-byte LE length + data (no padding, 256 % 4 == 0)
-            $tl.Add(0xFE); $tl.AddRange([System.BitConverter]::GetBytes($n.Length)[0..2]); $tl.AddRange($n)
+            $tl.Add(0xFE); $tl.AddRange([byte[]]([System.BitConverter]::GetBytes($n.Length)[0..2])); $tl.AddRange($n)
             # TL string: e is short, 1-byte length + data, padded to 4 bytes total
             $tl.Add([byte]$e.Length); $tl.AddRange($e)
             while ($tl.Count % 4 -ne 0) { $tl.Add(0) }
@@ -267,7 +267,7 @@ jobs:
             # padding loop above applies to the whole buffer only if needed — the
             # e-string itself is already 4 bytes, so this is a no-op in practice.
             $sha1 = [System.Security.Cryptography.SHA1]::Create().ComputeHash($tl.ToArray())
-            $computed = [System.BitConverter]::ToString($sha1[-8..-1]).Replace('-','').ToLowerInvariant()
+            $computed = [System.BitConverter]::ToString([byte[]]$sha1[-8..-1]).Replace('-','').ToLowerInvariant()
             # SHA1 low 64 bits are stored little-endian in Telegram fingerprints:
             # reverse the last 8 bytes to compare with the hex fingerprint as given.
             $computedLe = -join ($sha1[-1..-8] | ForEach-Object { $_.ToString('x2') })
