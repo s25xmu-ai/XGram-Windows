@@ -459,8 +459,17 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $arch = '${{ inputs.arch }}'
-          powershell -ExecutionPolicy Bypass -File 'Libraries/tdjson/build.ps1' -arch $arch -target windows
-          if ($LASTEXITCODE -ne 0) { throw "tdjson build failed with exit code $LASTEXITCODE." }
+          # Libraries/tdjson/build.ps1 resolves "../tdlib" and "../.." and
+          # does "cd build-*" relative to the CURRENT directory, so it must
+          # be run from inside Libraries/tdjson — from the repo root it
+          # looks for D:\a\XGram-Windows\tdlib, which does not exist.
+          Push-Location 'Libraries/tdjson'
+          try {
+            powershell -ExecutionPolicy Bypass -File 'build.ps1' -arch $arch -target windows
+            if ($LASTEXITCODE -ne 0) { throw "tdjson build failed with exit code $LASTEXITCODE." }
+          } finally {
+            Pop-Location
+          }
 
       - name: Build XGram (WinUI unpackaged)
         shell: pwsh
